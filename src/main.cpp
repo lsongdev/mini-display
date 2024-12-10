@@ -2,30 +2,29 @@
 #include <TFT_eSPI.h>
 #include <SPI.h>
 
-// 初始化显示屏
+// Initialize display
 TFT_eSPI tft = TFT_eSPI();
 
-// WiFi配置
+// WiFi configuration
 const char* ssid = "wifi@lsong.one";
 const char* password = "song940@163.com";
 
-// 服务器端口
+// Server port
 WiFiServer server(80);
 
-// 使用更小的缓冲区，每次处理一行数据
-const int BUFFER_HEIGHT = 1;  // 每次处理一行
-const int SCREEN_WIDTH = 240;
-uint16_t lineBuffer[SCREEN_WIDTH * BUFFER_HEIGHT];
+// Buffer for receiving data
+const int MAX_CHUNK_SIZE = 32;  // Maximum size of update regions
+uint16_t updateBuffer[MAX_CHUNK_SIZE * MAX_CHUNK_SIZE];
 
 void setup() {
   Serial.begin(115200);
   
-  // 初始化显示屏
+  // Initialize display
   tft.init();
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
   
-  // 连接WiFi
+  // Connect to WiFi
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -37,20 +36,33 @@ void setup() {
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
   
-  // 启动服务器
   server.begin();
 }
 
+bool readExactBytes(WiFiClient& client, uint8_t* buffer, size_t length) {
+  size_t received = 0;
+  unsigned long timeout = millis() + 1000;  // 1 second timeout
+  
+  while (received < length && millis() < timeout) {
+    if (client.available()) {
+      buffer[received++] = client.read();
+    }
+    yield();
+  }
+  
+  return received == length;
+}
+
 void loop() {
-  WiFiClient client = server.available();
+  WiFiClient client = server.accept();
   if (!client) {
     return;
   }
   
   Serial.println("New client connected");
   
-  // 等待客户端发送数据
-  unsigned long timeout = millis() + 5000;  // 5秒超时
+  // Wait for data
+  unsigned long timeout = millis() + 5000;
   while (!client.available() && millis() < timeout) {
     delay(10);
   }
@@ -61,65 +73,72 @@ void loop() {
     return;
   }
   
-  // 等待积累足够的数据
-  delay(100);
-  
-  // 读取图像尺寸信息
-  if (client.available() < 4) {
-    Serial.println("Invalid header");
+  // Read number of update regions
+  uint8_t numRegions = client.read();
+  if (numRegions == 0 || numRegions > 100) {  // Sanity check
+    Serial.println("Invalid number of regions");
     client.stop();
     return;
   }
   
-  uint16_t width = (client.read() << 8) | client.read();
-  uint16_t height = (client.read() << 8) | client.read();
+  Serial.printf("Receiving %d update regions\n", numRegions);
   
-  if (width != 240 || height != 240) {
-    Serial.printf("Invalid dimensions: %dx%d\n", width, height);
-    client.stop();
-    return;
-  }
-  
-  Serial.printf("Receiving image: %dx%d\n", width, height);
-  
-  // 逐行接收和显示图像
-  for (int y = 0; y < height; y++) {
-    // 读取一行数据
-    int bytesRead = 0;
-    unsigned long lineTimeout = millis() + 1000;  // 每行1秒超时
+  // Process each region
+  for (int i = 0; i < numRegions; i++) {
+    // Read region metadata
+    uint8_t metaData[8];
+    if (!readExactBytes(client, metaData, 8)) {
+      Serial.println("Failed to read region metadata");
+      client.stop();
+      return;
+    }
     
-    while (bytesRead < width * 2) {  // *2 因为每个像素2字节
-      if (client.available()) {
-        // 直接以高字节在前接收
-        uint8_t msb = client.read();
-        uint8_t lsb = client.read();
-        lineBuffer[bytesRead/2] = (msb << 8) | lsb;
-        bytesRead += 2;
-      } else if (millis() > lineTimeout) {
-        Serial.printf("Timeout reading line %d\n", y);
+    uint16_t x = (metaData[0] << 8) | metaData[1];
+    uint16_t y = (metaData[2] << 8) | metaData[3];
+    uint16_t width = (metaData[4] << 8) | metaData[5];
+    uint16_t height = (metaData[6] << 8) | metaData[7];
+    
+    // Validate dimensions
+    if (x + width > 240 || y + height > 240 || 
+        width > MAX_CHUNK_SIZE || height > MAX_CHUNK_SIZE) {
+      Serial.println("Invalid region dimensions");
+      client.stop();
+      return;
+    }
+    
+    // Read region data
+    size_t pixelCount = width * height;
+    // Read data row by row
+    for (int row = 0; row < height; row++) {
+      uint16_t* rowBuffer = &updateBuffer[row * width];
+      uint8_t* byteBuffer = (uint8_t*)rowBuffer;
+      
+      if (!readExactBytes(client, byteBuffer, width * 2)) {
+        Serial.printf("Failed to read row %d of region %d\n", row, i);
         client.stop();
         return;
       }
-      yield();  // 让出CPU给WiFi任务
+      
+      // Convert byte order if needed
+      for (int j = 0; j < width; j++) {
+        uint8_t temp = byteBuffer[j*2];
+        byteBuffer[j*2] = byteBuffer[j*2 + 1];
+        byteBuffer[j*2 + 1] = temp;
+      }
     }
     
-    // 显示这一行数据
-    tft.pushImage(0, y, width, 1, lineBuffer);
-    
-    // 每10行让出一次CPU时间
-    if (y % 10 == 0) {
-      yield();
-    }
+    // Update display with region data
+    tft.pushImage(x, y, width, height, updateBuffer);
+    yield();  // Give time to WiFi tasks
   }
   
-  // 发送成功确认信息
-  Serial.println("Image received successfully");
-  client.write("OK");  // 发送简短的确认消息
-  delay(10);  // 短暂延迟确保消息发送
+  // Send acknowledgment
+  client.write("OK");
+  delay(10);
   
-  // 清理连接
+  // Clean up connection
   while (client.available()) {
-    client.read();  // 清空任何剩余数据
+    client.read();
   }
   client.stop();
 }
