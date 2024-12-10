@@ -1,6 +1,7 @@
 
 .pio/
-.vscode
+.venv/
+.vscode/
 
 test/
 build/
