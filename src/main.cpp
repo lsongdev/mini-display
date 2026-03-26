@@ -107,7 +107,7 @@ void loop() {
     }
     
     // Read region data
-    size_t pixelCount = width * height;
+    // size_t pixelCount = width * height;
     // Read data row by row
     for (int row = 0; row < height; row++) {
       uint16_t* rowBuffer = &updateBuffer[row * width];

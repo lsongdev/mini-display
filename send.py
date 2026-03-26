@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+# pip3 install numpy --break-system-packages
+
 import time
 from PIL import ImageGrab, Image
 import socket
